@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DayTracker — Time Tracking Analytics</title>
+
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-app.js";
+    import { getAuth, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signOut, createUserWithEmailAndPassword, signInWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-auth.js";
+    import { getFirestore, doc, collection, query, where, getDocs, addDoc, updateDoc, deleteDoc, setDoc, onSnapshot, orderBy } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore.js";
+
+
+    const firebaseConfig = {
+      
+      apiKey: "...",
+      authDomain: "...",
+      projectId: "...",
+    };
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+
+
+    const config = {
+      minMinutesToAnalyse: 1440
+    };
+
+    const el = id => document.getElementById(id);
+    const loginSection = el('login-section');
+    const appSection = el('app-section');
+    const userEmailEl = el('user-email');
+    const signOutBtn = el('signout-btn');
+
+    const datePicker = el('date-picker');
+    const activitiesList = el('activities-list');
+    const addActivityForm = el('add-activity-form');
+    const remainingEl = el('remaining-minutes');
+    const analyseBtn = el('analyse-btn');
+    const dashboardSection = el('dashboard-section');
+    const noDataSection = el('no-data-section');
+    const summaryTotal = el('summary-total');
+    const summaryCount = el('summary-count');
+
+    let currentUser = null;
+    let currentDateKey = null; 
+    let unsubscribeSnapshot = null;
+    let activitiesCache = []; 
+    let pieChart = null;
+    let barChart = null;
+
+    el('google-signin').addEventListener('click', async () => {
+      const provider = new GoogleAuthProvider();
+      try {
+        await signInWithPopup(auth, provider);
+      } catch (err) { alert('Sign in failed: ' + err.message); }
+    });
+
+    el('email-signup').addEventListener('click', async () => {
+      const email = el('signup-email').value.trim();
+      const pw = el('signup-password').value;
+      if (!email || !pw) return alert('Provide email/password');
+      try {
+        await createUserWithEmailAndPassword(auth, email, pw);
+      } catch (err) { alert(err.message); }
+    });
+
+    el('email-signin').addEventListener('click', async () => {
+      const email = el('signin-email').value.trim();
+      const pw = el('signin-password').value;
+      if (!email || !pw) return alert('Provide email/password');
+      try {
+        await signInWithEmailAndPassword(auth, email, pw);
+      } catch (err) { alert(err.message); }
+    });
+
+    signOutBtn.addEventListener('click', () => signOut(auth));
+
+    onAuthStateChanged(auth, user => {
+      currentUser = user;
+      if (user) {
+        loginSection.style.display = 'none';
+        appSection.style.display = 'block';
+        userEmailEl.textContent = user.email;
+        const today = (new Date()).toISOString().slice(0,10);
+        datePicker.value = today;
+        loadForDate(today);
+      } else {
+        if (unsubscribeSnapshot) unsubscribeSnapshot();
+        loginSection.style.display = 'block';
+        appSection.style.display = 'none';
+      }
+    });
+
+    datePicker.addEventListener('change', e => {
+      loadForDate(e.target.value);
+    });
+
+    function dateKeyFromInput(inputVal) {
+      return inputVal;
+    }
+
+    addActivityForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const title = el('activity-title').value.trim();
+      const category = el('activity-category').value.trim() || 'Other';
+      const minutes = Number(el('activity-minutes').value);
+      if (!title || !minutes || minutes <= 0) return alert('Provide valid title and minutes');
+      const dateKey = currentDateKey;
+      const userId = currentUser.uid;
+      const totalNow = totalMinutes(activitiesCache);
+      if (totalNow + minutes > 1440) return alert('This would exceed 1440 minutes for the day.');
+      try {
+        await addDoc(collection(db, `users/${userId}/days/${dateKey}/activities`), {
+          title, category, minutes, createdAt: new Date()
+        });
+        addActivityForm.reset();
+      } catch (err) {
+        alert('Failed to add: ' + err.message);
+      }
+    });
+
+    async function loadForDate(dateVal) {
+      currentDateKey = dateKeyFromInput(dateVal);
+      if (unsubscribeSnapshot) unsubscribeSnapshot();
+
+      const activitiesCol = collection(db, `users/${currentUser.uid}/days/${currentDateKey}/activities`);
+      const q = query(activitiesCol, orderBy('createdAt'));
+      unsubscribeSnapshot = onSnapshot(q, snapshot => {
+        activitiesCache = [];
+        snapshot.forEach(doc => activitiesCache.push({ id: doc.id, ...doc.data() }));
+        renderActivities();
+        renderSummaryAndCharts();
+      }, e => {
+        console.error('Listen error', e);
+      });
+    }
+
+    function renderActivities() {
+      activitiesList.innerHTML = '';
+      if (activitiesCache.length === 0) {
+        activitiesList.innerHTML = '<p class="muted">No activities for this date. Start by adding one below.</p>';
+      } else {
+        activitiesCache.forEach(act => {
+          const li = document.createElement('li');
+          li.className = 'activity-item';
+          li.innerHTML = `
+            <div class="activity-main">
+              <strong>${escapeHtml(act.title)}</strong>
+              <span class="cat">${escapeHtml(act.category)}</span>
+              <span class="mins">${act.minutes} min</span>
+            </div>
+            <div class="activity-actions">
+              <button class="edit" data-id="${act.id}">Edit</button>
+              <button class="del" data-id="${act.id}">Delete</button>
+            </div>
+          `;
+          activitiesList.appendChild(li);
+        });
+        activitiesList.querySelectorAll('button.edit').forEach(btn => btn.addEventListener('click', onEditClick));
+        activitiesList.querySelectorAll('button.del').forEach(btn => btn.addEventListener('click', onDeleteClick));
+      }
+      updateRemaining();
+    }
+
+    async function onEditClick(e) {
+      const id = e.target.dataset.id;
+      const act = activitiesCache.find(a => a.id === id);
+      if (!act) return;
+      const newTitle = prompt('Edit activity title', act.title);
+      if (newTitle === null) return;
+      const newCategory = prompt('Edit category', act.category) || 'Other';
+      const newMinutes = Number(prompt('Edit minutes', String(act.minutes)));
+      if (!newMinutes || newMinutes <= 0) return alert('Invalid minutes');
+      const totalExcept = totalMinutes(activitiesCache.filter(a => a.id !== id));
+      if (totalExcept + newMinutes > 1440) return alert('Would exceed 1440 minutes');
+      try {
+        const docRef = doc(db, `users/${currentUser.uid}/days/${currentDateKey}/activities/${id}`);
+        await updateDoc(docRef, { title: newTitle, category: newCategory, minutes: newMinutes });
+      } catch (err) { alert(err.message); }
+    }
+
+    async function onDeleteClick(e) {
+      const id = e.target.dataset.id;
+      if (!confirm('Delete this activity?')) return;
+      try {
+        await deleteDoc(doc(db, `users/${currentUser.uid}/days/${currentDateKey}/activities/${id}`));
+      } catch (err) { alert(err.message); }
+    }
+
+    function totalMinutes(list) {
+      return list.reduce((s, a) => s + (Number(a.minutes) || 0), 0);
+    }
+
+    function updateRemaining() {
+      const total = totalMinutes(activitiesCache);
+      const remaining = 1440 - total;
+      remainingEl.textContent = `${remaining} minutes left`;
+      remainingEl.className = remaining < 0 ? 'warn' : '';
+      if (total >= config.minMinutesToAnalyse) {
+        analyseBtn.disabled = false;
+        analyseBtn.title = '';
+      } else {
+        analyseBtn.disabled = true;
+        analyseBtn.title = `Add ${config.minMinutesToAnalyse - total} more minutes to analyse (configurable)`;
+      }
+    }
+
+    analyseBtn.addEventListener('click', () => {
+      renderSummaryAndCharts(true);
+    });
+
+    function renderSummaryAndCharts(openDashboard = true) {
+      const total = totalMinutes(activitiesCache);
+      summaryTotal.textContent = `${(total/60).toFixed(2)} hours`;
+      summaryCount.textContent = `${activitiesCache.length} activities`;
+
+      if (activitiesCache.length === 0) {
+        dashboardSection.style.display = 'none';
+        noDataSection.style.display = 'block';
+        return;
+      } else {
+        dashboardSection.style.display = 'block';
+        noDataSection.style.display = 'none';
+      }
+
+      const categoryMap = {};
+      activitiesCache.forEach(a => {
+        const cat = a.category || 'Other';
+        categoryMap[cat] = (categoryMap[cat] || 0) + Number(a.minutes);
+      });
+
+      const labels = Object.keys(categoryMap);
+      const data = labels.map(l => categoryMap[l]);
+
+
+      const activityLabels = activitiesCache.map(a => a.title);
+      const durations = activitiesCache.map(a => Number(a.minutes));
+
+      
+      const pieCtx = document.getElementById('pieChart').getContext('2d');
+      if (pieChart) pieChart.destroy();
+      pieChart = new Chart(pieCtx, {
+        type: 'pie',
+        data: { labels, datasets: [{ data }] },
+        options: { responsive: true, plugins: { legend: { position: 'bottom' } } }
+      });
+
+      
+      const barCtx = document.getElementById('barChart').getContext('2d');
+      if (barChart) barChart.destroy();
+      barChart = new Chart(barCtx, {
+        type: 'bar',
+        data: { labels: activityLabels, datasets: [{ label: 'Minutes', data: durations }] },
+        options: { responsive: true, scales: { y: { beginAtZero: true } } }
+      });
+
+      if (openDashboard) {
+        dashboardSection.scrollIntoView({ behavior: 'smooth' });
+      }
+      updateRemaining();
+    }
+
+    function escapeHtml(s) {
+      return s ? s.replaceAll('<', '&lt;').replaceAll('>', '&gt;') : '';
+    }
+
+  </script>
+
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--accent:#6ee7b7;--muted:#9aa4b2}
+    body{font-family:Inter,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial;margin:0;background:linear-gradient(180deg,#071029 0%, #061527 100%);color:#e6eef6;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+    .container{width:100%;max-width:980px}
+    .card{background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border-radius:12px;padding:18px;box-shadow:0 6px 18px rgba(2,6,23,0.6);margin-bottom:16px}
+    header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+    h1{margin:0;font-size:20px}
+    .muted{color:var(--muted)}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    input[type="text"], input[type="number"], input[type="date"], select { padding:8px 10px;border-radius:8px;border:none;background:rgba(255,255,255,0.02);color:inherit;min-width:160px}
+    button{background:var(--accent);border:none;color:#04251a;padding:8px 12px;border-radius:8px;cursor:pointer}
+    button:disabled{opacity:0.5;cursor:not-allowed}
+    .activity-item{display:flex;justify-content:space-between;align-items:center;padding:8px;border-radius:8px;margin-bottom:8px;background:rgba(255,255,255,0.01)}
+    .activity-main .cat{margin-left:8px;font-size:12px;color:var(--muted)}
+    .activity-item .activity-actions button{margin-left:6px;background:transparent;color:var(--muted);padding:6px;border-radius:6px;border:1px solid rgba(255,255,255,0.03)}
+    .warn{color:#ff7b7b}
+    #dashboard-section{display:none}
+    @media(max-width:700px){header{flex-direction:column;align-items:flex-start} .row{flex-direction:column}}
+  </style>
+</head>
+<body>
+  <div class="container">
+
+
+    <div id="login-section" class="card">
+      <header>
+        <h1>DayTracker</h1>
+        <div class="muted">Log time. See your 24 hours.</div>
+      </header>
+
+      <div class="row" style="align-items:center">
+        <div>
+          <button id="google-signin">Sign in with Google</button>
+        </div>
+
+        <div style="border-left:1px solid rgba(255,255,255,0.03);padding-left:16px">
+          <div><input id="signup-email" placeholder="Email (signup)" /></div>
+          <div style="margin-top:6px"><input id="signup-password" type="password" placeholder="Password" /></div>
+          <div style="margin-top:8px"><button id="email-signup">Create account</button></div>
+        </div>
+
+        <div style="border-left:1px solid rgba(255,255,255,0.03);padding-left:16px">
+          <div><input id="signin-email" placeholder="Email (signin)" /></div>
+          <div style="margin-top:6px"><input id="signin-password" type="password" placeholder="Password" /></div>
+          <div style="margin-top:8px"><button id="email-signin">Sign in</button></div>
+        </div>
+      </div>
+    </div>
+
+
+    <div id="app-section" style="display:none">
+      <div class="card">
+        <header>
+          <div>
+            <h1>DayTracker</h1>
+            <div class="muted">Logged in as <span id="user-email"></span></div>
+          </div>
+          <div>
+            <button id="signout-btn">Sign out</button>
+          </div>
+        </header>
+
+        <div class="row">
+          <div>
+            <label for="date-picker" class="muted">Select date</label><br />
+            <input type="date" id="date-picker" />
+          </div>
+
+          <div style="flex:1">
+            <label class="muted">Remaining</label>
+            <div id="remaining-minutes">1440 minutes left</div>
+          </div>
+
+          <div style="align-self:flex-end">
+            <button id="analyse-btn" disabled>Analyse</button>
+          </div>
+        </div>
+      </div>
+
+
+      <div class="card">
+        <h3>Activities</h3>
+        <ul id="activities-list" style="list-style:none;padding:0;margin:0"></ul>
+
+        <hr style="margin:12px 0;border-color:rgba(255,255,255,0.03)" />
+
+        <form id="add-activity-form" class="row" style="align-items:center">
+          <input id="activity-title" type="text" placeholder="Activity title (e.g., Sleep)" required />
+          <input id="activity-category" type="text" placeholder="Category (Work/Study/...)"/>
+          <input id="activity-minutes" type="number" placeholder="Minutes" required />
+          <button type="submit">Add</button>
+        </form>
+      </div>
+
+      <div id="no-data-section" class="card" style="display:none;text-align:center">
+        <div style="font-size:40px">🗂️</div>
+        <h3>No data available</h3>
+        <p class="muted">No activities logged for this date. Start logging to see analytics.</p>
+        <p><button onclick="document.getElementById('activity-title').focus()">Start logging your day now</button></p>
+      </div>
+
+      <div id="dashboard-section" class="card">
+        <h3>Analytics</h3>
+        <div class="row" style="gap:20px">
+          <div style="flex:1;min-width:260px">
+            <canvas id="pieChart" width="400" height="300"></canvas>
+          </div>
+          <div style="flex:1;min-width:260px">
+            <canvas id="barChart" width="400" height="300"></canvas>
+          </div>
+        </div>
+
+        <hr style="margin:12px 0;border-color:rgba(255,255,255,0.03)" />
+
+        <div class="row">
+          <div class="card" style="padding:12px;margin:0">
+            <div class="muted">Total time</div>
+            <div id="summary-total">0 hours</div>
+          </div>
+          <div class="card" style="padding:12px;margin:0">
+            <div class="muted">Number of activities</div>
+            <div id="summary-count">0</div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+</body>
+</html>
